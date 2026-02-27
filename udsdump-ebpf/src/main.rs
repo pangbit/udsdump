@@ -2,7 +2,10 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes},
+    helpers::{
+        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_user_buf,
+    },
     macros::{kprobe, map},
     maps::{Array, PerCpuArray, PerfEventArray},
     programs::ProbeContext,
@@ -30,6 +33,16 @@ const OFF_SOCKET_SK: u64 = 24;
 const OFF_UNIX_SOCK_ADDR: u64 = 760;
 const OFF_UNIX_SOCK_PEER: u64 = 848;
 const OFF_UNIX_ADDR_SUN_PATH: u64 = 8 + 2; // sockaddr_un.sun_path
+
+// struct msghdr: msg_iter (iov_iter) is embedded at offset 16
+const OFF_MSGHDR_IOV_ITER: u64 = 16;
+// struct iov_iter offsets:
+//   iter_type at 0 (u8), __ubuf_iovec/iov at 16, count at 24
+const OFF_IOV_ITER_TYPE: u64 = 0;
+const OFF_IOV_ITER_IOV: u64 = 16;  // union: __iov ptr or __ubuf_iovec inline
+// struct iovec: iov_base at 0, iov_len at 8
+const ITER_UBUF: u8 = 0;
+const ITER_IOVEC: u8 = 1;
 
 /// Read sun_path from a unix_sock's addr.
 /// Returns path length, or 0 if no addr / no path.
@@ -74,6 +87,70 @@ unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u3
         return 0;
     }
     unsafe { read_path_from_sk(peer_ptr, path_buf) }
+}
+
+/// Read payload data from msghdr's iov_iter into event.data.
+/// Supports ITER_UBUF and ITER_IOVEC (first iov segment only).
+unsafe fn read_payload(msg_ptr: u64, event: &mut UdsEvent) {
+    // iov_iter is embedded in msghdr at offset 16
+    let iter_base = msg_ptr + OFF_MSGHDR_IOV_ITER;
+
+    // Read iter_type
+    let iter_type: u8 = match unsafe { bpf_probe_read_kernel((iter_base + OFF_IOV_ITER_TYPE) as *const u8) } {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let (iov_base, iov_len) = match iter_type {
+        ITER_UBUF => {
+            // __ubuf_iovec is inline: iov_base at iter+16, iov_len at iter+24
+            let base: u64 = match unsafe { bpf_probe_read_kernel((iter_base + OFF_IOV_ITER_IOV) as *const u64) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let len: u64 = match unsafe { bpf_probe_read_kernel((iter_base + OFF_IOV_ITER_IOV + 8) as *const u64) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            (base, len)
+        }
+        ITER_IOVEC => {
+            // __iov is a pointer to struct iovec array; read first element
+            let iov_ptr: u64 = match unsafe { bpf_probe_read_kernel((iter_base + OFF_IOV_ITER_IOV) as *const u64) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if iov_ptr == 0 {
+                return;
+            }
+            let base: u64 = match unsafe { bpf_probe_read_kernel(iov_ptr as *const u64) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let len: u64 = match unsafe { bpf_probe_read_kernel((iov_ptr + 8) as *const u64) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            (base, len)
+        }
+        _ => return,
+    };
+
+    if iov_base == 0 || iov_len == 0 {
+        return;
+    }
+
+    // Cap to MAX_PAYLOAD_SIZE
+    let to_read = if iov_len > MAX_PAYLOAD_SIZE as u64 {
+        MAX_PAYLOAD_SIZE
+    } else {
+        iov_len as usize
+    };
+
+    // Read user-space payload
+    if unsafe { bpf_probe_read_user_buf(iov_base as *const u8, &mut event.data[..to_read]) }.is_ok() {
+        event.captured_len = to_read as u32;
+    }
 }
 
 /// Check if the event should be filtered out.
@@ -149,6 +226,12 @@ fn handle_msg(
     // Read message size from the third argument (size_t len)
     let msg_len: u64 = ctx.arg(2).unwrap_or(0);
     event.data_len = msg_len as u32;
+
+    // Read payload from msghdr->msg_iter
+    let msg_ptr: u64 = ctx.arg(1).unwrap_or(0);
+    if msg_ptr != 0 {
+        unsafe { read_payload(msg_ptr, event) };
+    }
 
     EVENTS.output(ctx, event, 0);
     Ok(0)
