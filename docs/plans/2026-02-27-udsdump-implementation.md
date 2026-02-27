@@ -1,7 +1,5 @@
 # udsdump Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Build a Linux UDS packet capture and analysis tool using Rust + eBPF (Aya framework).
 
 **Architecture:** Three-crate workspace: `udsdump-common` (shared types, no_std), `udsdump-ebpf` (kprobe probes, no_std), `udsdump` (userspace CLI with clap + tokio). eBPF probes hook into `unix_stream_sendmsg`/`recvmsg` and `unix_dgram_sendmsg`/`recvmsg` to capture UDS traffic, transmitting events via PerfEventArray to userspace for filtering and display.

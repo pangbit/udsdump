@@ -10,6 +10,9 @@ default-members = ["udsdump", "udsdump-common"]
 [workspace.package]
 license = "MIT OR Apache-2.0"
 edition = "2024"
+repository = "https://github.com/pangbit/udsdump"
+description = "Unix Domain Socket packet capture and analysis tool for Linux"
+readme = "README.md"
 
 [workspace.dependencies]
 aya = { git = "https://github.com/aya-rs/aya", default-features = false }
