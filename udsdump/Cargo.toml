@@ -13,7 +13,7 @@ clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "user"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
 bytes = { workspace = true, default-features = true }
 
