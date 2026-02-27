@@ -187,10 +187,12 @@ fn attach_probe(ebpf: &mut Ebpf, prog_name: &str, fn_name: &str) -> anyhow::Resu
 }
 
 fn setup_filter(ebpf: &mut Ebpf, args: &CaptureArgs) -> anyhow::Result<()> {
+    let needs_payload = args.hex || args.ascii || args.json;
     let mut config = FilterConfig {
         target_pid: args.pid.unwrap_or(0),
         target_path: [0u8; MAX_PATH_LEN],
         target_path_len: 0,
+        capture_payload: if needs_payload { 1 } else { 0 },
     };
 
     if let Some(ref path) = args.path {

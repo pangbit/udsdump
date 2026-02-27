@@ -66,6 +66,8 @@ pub struct FilterConfig {
     pub target_path: [u8; MAX_PATH_LEN],
     /// Length of the target_path prefix to match.
     pub target_path_len: u32,
+    /// Whether to capture payload data. 0 = no, 1 = yes.
+    pub capture_payload: u32,
 }
 
 #[cfg(feature = "user")]

@@ -227,10 +227,14 @@ fn handle_msg(
     let msg_len: u64 = ctx.arg(2).unwrap_or(0);
     event.data_len = msg_len as u32;
 
-    // Read payload from msghdr->msg_iter
-    let msg_ptr: u64 = ctx.arg(1).unwrap_or(0);
-    if msg_ptr != 0 {
-        unsafe { read_payload(msg_ptr, event) };
+    // Read payload only if enabled in filter config
+    if let Some(config) = FILTER.get(0) {
+        if config.capture_payload != 0 {
+            let msg_ptr: u64 = ctx.arg(1).unwrap_or(0);
+            if msg_ptr != 0 {
+                unsafe { read_payload(msg_ptr, event) };
+            }
+        }
     }
 
     EVENTS.output(ctx, event, 0);

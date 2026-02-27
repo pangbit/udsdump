@@ -67,6 +67,7 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
         target_pid: 0,
         target_path: [0u8; MAX_PATH_LEN],
         target_path_len: 0,
+        capture_payload: 0,
     };
     let mut filter_map: Array<_, FilterConfig> =
         Array::try_from(ebpf.map_mut("FILTER").unwrap())?;
