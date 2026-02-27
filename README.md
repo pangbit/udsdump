@@ -157,7 +157,7 @@ Events are transmitted from kernel to userspace via `PerfEventArray`, with per-C
 ## Known Limitations
 
 - Kernel struct offsets are currently hardcoded for kernel 6.8. Cross-kernel portability via BTF/CO-RE is planned.
-- Payload data capture is not yet implemented (metadata only: process, path, direction, size).
+- Payload capture reads the first iov segment only (up to 256 bytes). Multi-segment iov is not yet supported.
 - SEQPACKET socket probes are not yet implemented.
 
 ## License
