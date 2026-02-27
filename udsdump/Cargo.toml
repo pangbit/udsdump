@@ -14,7 +14,7 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
 bytes = { workspace = true, default-features = true }
 
 [build-dependencies]

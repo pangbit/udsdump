@@ -22,7 +22,7 @@ static FILTER: Array<FilterConfig> = Array::with_max_entries(1, 0);
 /// These offsets should be refined with BTF/CO-RE for full portability.
 unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u32 {
     // struct socket { ..., struct sock *sk; } — sk at offset 32
-    let sk_ptr: u64 = match bpf_probe_read_kernel((sock_ptr + 32) as *const u64) {
+    let sk_ptr: u64 = match unsafe { bpf_probe_read_kernel((sock_ptr + 32) as *const u64) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
@@ -33,7 +33,7 @@ unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u3
 
     // struct unix_sock { struct sock sk; ...; struct unix_address *addr; }
     // addr offset ~880 on 5.15+ kernels
-    let addr_ptr: u64 = match bpf_probe_read_kernel((sk_ptr + 880) as *const u64) {
+    let addr_ptr: u64 = match unsafe { bpf_probe_read_kernel((sk_ptr + 880) as *const u64) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
@@ -46,7 +46,7 @@ unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u3
     // sockaddr_un starts at offset 12, sun_path at +2 within it
     let sun_path_ptr = (addr_ptr + 12 + 2) as *const u8;
 
-    match bpf_probe_read_kernel_str_bytes(sun_path_ptr, path_buf) {
+    match unsafe { bpf_probe_read_kernel_str_bytes(sun_path_ptr, path_buf) } {
         Ok(s) => s.len() as u32,
         Err(_) => 0,
     }
@@ -91,7 +91,7 @@ unsafe fn handle_msg(
     let tid = ctx.pid();
 
     let mut event = UdsEvent {
-        timestamp_ns: bpf_ktime_get_ns(),
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
         pid,
         tid,
         comm: [0u8; 16],
@@ -113,10 +113,10 @@ unsafe fn handle_msg(
 
     // Read socket path
     let sock_ptr: u64 = ctx.arg(0).ok_or(1u32)?;
-    read_sock_path(sock_ptr, &mut event.path);
+    unsafe { read_sock_path(sock_ptr, &mut event.path) };
 
     // Apply kernel-side filter
-    if should_filter(pid, &event.path) {
+    if unsafe { should_filter(pid, &event.path) } {
         return Ok(0);
     }
 
