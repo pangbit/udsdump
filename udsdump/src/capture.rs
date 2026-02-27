@@ -131,19 +131,21 @@ async fn run_async(args: CaptureArgs) -> anyhow::Result<()> {
     let show_json = args.json;
     let max_bytes = args.max_bytes;
 
-    // Handle Ctrl+C
-    let running_clone = running.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        running_clone.store(false, Ordering::Relaxed);
-    });
-
     eprintln!("Capturing UDS traffic... Press Ctrl+C to stop.");
 
-    while let Some(event) = rx.recv().await {
-        if !running.load(Ordering::Relaxed) {
-            break;
-        }
+    loop {
+        let event = tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(e) => e,
+                    None => break, // all senders dropped
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
+        };
 
         if !user_filter.matches(&event) {
             continue;

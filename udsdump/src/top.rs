@@ -125,13 +125,6 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
     }
     drop(tx);
 
-    // Handle Ctrl+C
-    let running_clone = running.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        running_clone.store(false, Ordering::Relaxed);
-    });
-
     let mut stats: HashMap<u32, ProcessStats> = HashMap::new();
     let display_interval = Duration::from_secs(args.interval);
 
@@ -151,10 +144,10 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
                 print_top(&stats, &args);
                 last_display = tokio::time::Instant::now();
             }
-        }
-
-        if !running.load(Ordering::Relaxed) {
-            break;
+            _ = tokio::signal::ctrl_c() => {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
         }
     }
 
