@@ -9,6 +9,7 @@ use bytes::BytesMut;
 use log::{debug, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::sync::mpsc;
 
 use udsdump_common::{FilterConfig, UdsEvent, MAX_PATH_LEN};
 
@@ -32,14 +33,14 @@ async fn run_async(args: CaptureArgs) -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // Load eBPF program
-    let mut ebpf = Ebpf::load(include_bytes_aligned!(concat!(
+    // Load eBPF program. Leak to get 'static lifetime needed by spawned tasks.
+    let ebpf = Box::leak(Box::new(Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/udsdump"
-    )))?;
+    )))?));
 
     // Initialize eBPF logger
-    match aya_log::EbpfLogger::init(&mut ebpf) {
+    match aya_log::EbpfLogger::init(ebpf) {
         Err(e) => warn!("failed to initialize eBPF logger: {e}"),
         Ok(logger) => {
             let mut logger = AsyncFd::with_interest(logger, Interest::READABLE)?;
@@ -54,13 +55,13 @@ async fn run_async(args: CaptureArgs) -> anyhow::Result<()> {
     }
 
     // Set up kernel-side filter
-    setup_filter(&mut ebpf, &args)?;
+    setup_filter(ebpf, &args)?;
 
     // Attach kprobes
-    attach_probe(&mut ebpf, "udsdump_stream_sendmsg", "unix_stream_sendmsg")?;
-    attach_probe(&mut ebpf, "udsdump_stream_recvmsg", "unix_stream_recvmsg")?;
-    attach_probe(&mut ebpf, "udsdump_dgram_sendmsg", "unix_dgram_sendmsg")?;
-    attach_probe(&mut ebpf, "udsdump_dgram_recvmsg", "unix_dgram_recvmsg")?;
+    attach_probe(ebpf, "udsdump_stream_sendmsg", "unix_stream_sendmsg")?;
+    attach_probe(ebpf, "udsdump_stream_recvmsg", "unix_stream_recvmsg")?;
+    attach_probe(ebpf, "udsdump_dgram_sendmsg", "unix_dgram_sendmsg")?;
+    attach_probe(ebpf, "udsdump_dgram_recvmsg", "unix_dgram_recvmsg")?;
 
     // Build userspace filter
     let user_filter = EventFilter {
@@ -73,20 +74,58 @@ async fn run_async(args: CaptureArgs) -> anyhow::Result<()> {
         }),
     };
 
-    // Open perf event buffers
+    // Open perf event buffers and spawn per-CPU reader tasks
     let mut perf_array = PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let cpus = online_cpus().map_err(|(_, e)| e)?;
-    let mut async_fds = Vec::new();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let count = Arc::new(AtomicU64::new(0));
+
+    // Channel for events from per-CPU readers
+    let (tx, mut rx) = mpsc::channel::<UdsEvent>(1024);
 
     for cpu_id in cpus {
         let buf = perf_array.open(cpu_id, None)?;
-        let async_fd = AsyncFd::with_interest(buf, Interest::READABLE)?;
-        async_fds.push(async_fd);
-    }
+        let mut async_fd = AsyncFd::with_interest(buf, Interest::READABLE)?;
+        let tx = tx.clone();
+        let running = running.clone();
 
-    // Event reading loop
-    let running = Arc::new(AtomicBool::new(true));
-    let count = Arc::new(AtomicU64::new(0));
+        tokio::spawn(async move {
+            let mut out_bufs: Vec<BytesMut> = (0..16)
+                .map(|_| BytesMut::with_capacity(core::mem::size_of::<UdsEvent>() + 64))
+                .collect();
+
+            while running.load(Ordering::Relaxed) {
+                let mut guard = match async_fd.readable_mut().await {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                let buf = guard.get_inner_mut();
+                match buf.read_events(&mut out_bufs) {
+                    Ok(events) => {
+                        for i in 0..events.read {
+                            let data = &out_bufs[i];
+                            if data.len() >= core::mem::size_of::<UdsEvent>() {
+                                let event = unsafe { *(data.as_ptr() as *const UdsEvent) };
+                                if tx.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        if events.lost > 0 {
+                            eprintln!("Warning: lost {} events on CPU {}", events.lost, cpu_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("error reading perf events on CPU {}: {e}", cpu_id);
+                    }
+                }
+                guard.clear_ready();
+            }
+        });
+    }
+    drop(tx); // Drop sender so rx closes when all tasks exit
+
     let max_count = args.count;
     let show_hex = args.hex;
     let show_json = args.json;
@@ -101,61 +140,35 @@ async fn run_async(args: CaptureArgs) -> anyhow::Result<()> {
 
     eprintln!("Capturing UDS traffic... Press Ctrl+C to stop.");
 
-    let mut out_bufs: Vec<BytesMut> = (0..16)
-        .map(|_| BytesMut::with_capacity(core::mem::size_of::<UdsEvent>() + 64))
-        .collect();
+    while let Some(event) = rx.recv().await {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
 
-    while running.load(Ordering::Relaxed) {
-        for async_fd in &mut async_fds {
-            let mut guard = async_fd.readable_mut().await?;
-            let buf = guard.get_inner_mut();
+        if !user_filter.matches(&event) {
+            continue;
+        }
 
-            match buf.read_events(&mut out_bufs) {
-                Ok(events) => {
-                    for i in 0..events.read {
-                        let data = &out_bufs[i];
-                        if data.len() < core::mem::size_of::<UdsEvent>() {
-                            continue;
-                        }
-                        let event = unsafe { &*(data.as_ptr() as *const UdsEvent) };
-
-                        if !user_filter.matches(event) {
-                            continue;
-                        }
-
-                        if show_json {
-                            println!("{}", display::format_event_json(event));
-                        } else {
-                            println!("{}", display::format_event_header(event));
-                            let payload = &event.data[..event.captured_len as usize];
-                            if !payload.is_empty() {
-                                if show_hex {
-                                    print!("{}", display::format_payload_hex(payload, max_bytes));
-                                } else {
-                                    println!("  {}", display::format_payload_ascii(payload, max_bytes));
-                                }
-                            }
-                        }
-
-                        let current = count.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Some(max) = max_count {
-                            if current >= max {
-                                running.store(false, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-
-                    if events.lost > 0 {
-                        eprintln!("Warning: lost {} events", events.lost);
-                    }
-                }
-                Err(e) => {
-                    warn!("error reading perf events: {e}");
+        if show_json {
+            println!("{}", display::format_event_json(&event));
+        } else {
+            println!("{}", display::format_event_header(&event));
+            let payload = &event.data[..event.captured_len as usize];
+            if !payload.is_empty() {
+                if show_hex {
+                    print!("{}", display::format_payload_hex(payload, max_bytes));
+                } else {
+                    println!("  {}", display::format_payload_ascii(payload, max_bytes));
                 }
             }
+        }
 
-            guard.clear_ready();
+        let current = count.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(max) = max_count {
+            if current >= max {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
         }
     }
 

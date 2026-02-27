@@ -4,7 +4,7 @@
 use aya_ebpf::{
     helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes},
     macros::{kprobe, map},
-    maps::{Array, PerfEventArray},
+    maps::{Array, PerCpuArray, PerfEventArray},
     programs::ProbeContext,
     EbpfContext,
 };
@@ -16,51 +16,73 @@ static EVENTS: PerfEventArray<UdsEvent> = PerfEventArray::new(0);
 #[map]
 static FILTER: Array<FilterConfig> = Array::with_max_entries(1, 0);
 
-/// Read the socket path from unix_sock -> addr -> name -> sun_path.
-///
-/// Traverses kernel structures with hardcoded offsets for >= 5.4 kernels.
-/// These offsets should be refined with BTF/CO-RE for full portability.
-unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u32 {
-    // struct socket { ..., struct sock *sk; } — sk at offset 32
-    let sk_ptr: u64 = match unsafe { bpf_probe_read_kernel((sock_ptr + 32) as *const u64) } {
+/// Per-CPU scratch buffer for building events without blowing the eBPF stack.
+/// UdsEvent is too large (~420 bytes) to allocate on the 512-byte eBPF stack.
+#[map]
+static EVENT_BUF: PerCpuArray<UdsEvent> = PerCpuArray::with_max_entries(1, 0);
+
+// Kernel struct offsets for kernel 6.8 (verified with pahole):
+// struct socket:    sk at offset 24
+// struct unix_sock: addr at offset 760, peer at offset 848
+// struct unix_address: name (sockaddr_un) at offset 8, sun_path at +2
+
+const OFF_SOCKET_SK: u64 = 24;
+const OFF_UNIX_SOCK_ADDR: u64 = 760;
+const OFF_UNIX_SOCK_PEER: u64 = 848;
+const OFF_UNIX_ADDR_SUN_PATH: u64 = 8 + 2; // sockaddr_un.sun_path
+
+/// Read sun_path from a unix_sock's addr.
+/// Returns path length, or 0 if no addr / no path.
+unsafe fn read_path_from_sk(sk_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u32 {
+    let addr_ptr: u64 = match unsafe { bpf_probe_read_kernel((sk_ptr + OFF_UNIX_SOCK_ADDR) as *const u64) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
-
-    if sk_ptr == 0 {
-        return 0;
-    }
-
-    // struct unix_sock { struct sock sk; ...; struct unix_address *addr; }
-    // addr offset ~880 on 5.15+ kernels
-    let addr_ptr: u64 = match unsafe { bpf_probe_read_kernel((sk_ptr + 880) as *const u64) } {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-
     if addr_ptr == 0 {
         return 0;
     }
-
-    // struct unix_address { atomic_t refcnt; int len; struct sockaddr_un name; }
-    // sockaddr_un starts at offset 12, sun_path at +2 within it
-    let sun_path_ptr = (addr_ptr + 12 + 2) as *const u8;
-
+    let sun_path_ptr = (addr_ptr + OFF_UNIX_ADDR_SUN_PATH) as *const u8;
     match unsafe { bpf_probe_read_kernel_str_bytes(sun_path_ptr, path_buf) } {
         Ok(s) => s.len() as u32,
         Err(_) => 0,
     }
 }
 
+/// Read the socket path from struct socket.
+/// First tries the socket's own addr, then falls back to peer's addr.
+unsafe fn read_sock_path(sock_ptr: u64, path_buf: &mut [u8; MAX_PATH_LEN]) -> u32 {
+    let sk_ptr: u64 = match unsafe { bpf_probe_read_kernel((sock_ptr + OFF_SOCKET_SK) as *const u64) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if sk_ptr == 0 {
+        return 0;
+    }
+
+    // Try own addr first
+    let len = unsafe { read_path_from_sk(sk_ptr, path_buf) };
+    if len > 0 {
+        return len;
+    }
+
+    // Fall back to peer's addr
+    let peer_ptr: u64 = match unsafe { bpf_probe_read_kernel((sk_ptr + OFF_UNIX_SOCK_PEER) as *const u64) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if peer_ptr == 0 {
+        return 0;
+    }
+    unsafe { read_path_from_sk(peer_ptr, path_buf) }
+}
+
 /// Check if the event should be filtered out.
 /// Returns true if the event should be DROPPED.
-unsafe fn should_filter(pid: u32, path: &[u8; MAX_PATH_LEN]) -> bool {
+fn should_filter(pid: u32, path: &[u8; MAX_PATH_LEN]) -> bool {
     if let Some(config) = FILTER.get(0) {
-        // Filter by PID
         if config.target_pid != 0 && config.target_pid != pid {
             return true;
         }
-        // Filter by path prefix
         let path_len = config.target_path_len as usize;
         if path_len > 0 && path_len <= MAX_PATH_LEN {
             let mut i = 0;
@@ -82,7 +104,8 @@ unsafe fn should_filter(pid: u32, path: &[u8; MAX_PATH_LEN]) -> bool {
 }
 
 /// Core logic shared by all send/recv probes.
-unsafe fn handle_msg(
+/// Uses PerCpuArray scratch buffer to avoid stack overflow.
+fn handle_msg(
     ctx: &ProbeContext,
     direction: Direction,
     sock_type: SockType,
@@ -90,21 +113,24 @@ unsafe fn handle_msg(
     let pid = ctx.tgid();
     let tid = ctx.pid();
 
-    let mut event = UdsEvent {
-        timestamp_ns: unsafe { bpf_ktime_get_ns() },
-        pid,
-        tid,
-        comm: [0u8; 16],
-        sock_inode: 0,
-        peer_inode: 0,
-        path: [0u8; MAX_PATH_LEN],
-        direction: direction as u8,
-        sock_type: sock_type as u8,
-        _pad: [0u8; 2],
-        data_len: 0,
-        captured_len: 0,
-        data: [0u8; MAX_PAYLOAD_SIZE],
-    };
+    // Get a mutable reference to the per-CPU event buffer
+    let event = EVENT_BUF.get_ptr_mut(0).ok_or(1u32)?;
+    let event = unsafe { &mut *event };
+
+    // Zero out and populate the event
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event.pid = pid;
+    event.tid = tid;
+    event.comm = [0u8; 16];
+    event.sock_inode = 0;
+    event.peer_inode = 0;
+    event.path = [0u8; MAX_PATH_LEN];
+    event.direction = direction as u8;
+    event.sock_type = sock_type as u8;
+    event._pad = [0u8; 2];
+    event.data_len = 0;
+    event.captured_len = 0;
+    event.data = [0u8; MAX_PAYLOAD_SIZE];
 
     // Get process name
     if let Ok(comm) = ctx.command() {
@@ -116,7 +142,7 @@ unsafe fn handle_msg(
     unsafe { read_sock_path(sock_ptr, &mut event.path) };
 
     // Apply kernel-side filter
-    if unsafe { should_filter(pid, &event.path) } {
+    if should_filter(pid, &event.path) {
         return Ok(0);
     }
 
@@ -124,11 +150,7 @@ unsafe fn handle_msg(
     let msg_len: u64 = ctx.arg(2).unwrap_or(0);
     event.data_len = msg_len as u32;
 
-    // TODO: Read payload from msg_iter.iov->iov_base
-    // This requires traversing the iov_iter structure which is complex in eBPF.
-    // For now we capture metadata only; payload capture will be added in a follow-up.
-
-    EVENTS.output(ctx, &event, 0);
+    EVENTS.output(ctx, event, 0);
     Ok(0)
 }
 
@@ -136,7 +158,7 @@ unsafe fn handle_msg(
 
 #[kprobe]
 pub fn udsdump_stream_sendmsg(ctx: ProbeContext) -> u32 {
-    match unsafe { handle_msg(&ctx, Direction::Send, SockType::Stream) } {
+    match handle_msg(&ctx, Direction::Send, SockType::Stream) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
@@ -144,7 +166,7 @@ pub fn udsdump_stream_sendmsg(ctx: ProbeContext) -> u32 {
 
 #[kprobe]
 pub fn udsdump_stream_recvmsg(ctx: ProbeContext) -> u32 {
-    match unsafe { handle_msg(&ctx, Direction::Recv, SockType::Stream) } {
+    match handle_msg(&ctx, Direction::Recv, SockType::Stream) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
@@ -154,7 +176,7 @@ pub fn udsdump_stream_recvmsg(ctx: ProbeContext) -> u32 {
 
 #[kprobe]
 pub fn udsdump_dgram_sendmsg(ctx: ProbeContext) -> u32 {
-    match unsafe { handle_msg(&ctx, Direction::Send, SockType::Dgram) } {
+    match handle_msg(&ctx, Direction::Send, SockType::Dgram) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
@@ -162,7 +184,7 @@ pub fn udsdump_dgram_sendmsg(ctx: ProbeContext) -> u32 {
 
 #[kprobe]
 pub fn udsdump_dgram_recvmsg(ctx: ProbeContext) -> u32 {
-    match unsafe { handle_msg(&ctx, Direction::Recv, SockType::Dgram) } {
+    match handle_msg(&ctx, Direction::Recv, SockType::Dgram) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }

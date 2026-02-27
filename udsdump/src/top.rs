@@ -10,7 +10,8 @@ use bytes::BytesMut;
 use log::{debug, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::time::{Duration, interval};
+use tokio::sync::mpsc;
+use tokio::time::Duration;
 
 use udsdump_common::{FilterConfig, UdsEvent, MAX_PATH_LEN};
 use crate::TopArgs;
@@ -40,14 +41,14 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // Load eBPF program
-    let mut ebpf = Ebpf::load(include_bytes_aligned!(concat!(
+    // Load eBPF program. Leak to get 'static lifetime needed by spawned tasks.
+    let ebpf = Box::leak(Box::new(Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/udsdump"
-    )))?;
+    )))?));
 
     // Initialize eBPF logger
-    match aya_log::EbpfLogger::init(&mut ebpf) {
+    match aya_log::EbpfLogger::init(ebpf) {
         Err(e) => warn!("failed to initialize eBPF logger: {e}"),
         Ok(logger) => {
             let mut logger = AsyncFd::with_interest(logger, Interest::READABLE)?;
@@ -72,24 +73,59 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
     filter_map.set(0, config, 0)?;
 
     // Attach kprobes
-    attach_probe(&mut ebpf, "udsdump_stream_sendmsg", "unix_stream_sendmsg")?;
-    attach_probe(&mut ebpf, "udsdump_stream_recvmsg", "unix_stream_recvmsg")?;
-    attach_probe(&mut ebpf, "udsdump_dgram_sendmsg", "unix_dgram_sendmsg")?;
-    attach_probe(&mut ebpf, "udsdump_dgram_recvmsg", "unix_dgram_recvmsg")?;
+    attach_probe(ebpf, "udsdump_stream_sendmsg", "unix_stream_sendmsg")?;
+    attach_probe(ebpf, "udsdump_stream_recvmsg", "unix_stream_recvmsg")?;
+    attach_probe(ebpf, "udsdump_dgram_sendmsg", "unix_dgram_sendmsg")?;
+    attach_probe(ebpf, "udsdump_dgram_recvmsg", "unix_dgram_recvmsg")?;
 
-    // Open perf event buffers
+    // Open perf event buffers and spawn per-CPU reader tasks
     let mut perf_array = PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let cpus = online_cpus().map_err(|(_, e)| e)?;
-    let mut async_fds = Vec::new();
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    let (tx, mut rx) = mpsc::channel::<UdsEvent>(1024);
 
     for cpu_id in cpus {
         let buf = perf_array.open(cpu_id, None)?;
-        let async_fd = AsyncFd::with_interest(buf, Interest::READABLE)?;
-        async_fds.push(async_fd);
+        let mut async_fd = AsyncFd::with_interest(buf, Interest::READABLE)?;
+        let tx = tx.clone();
+        let running = running.clone();
+
+        tokio::spawn(async move {
+            let mut out_bufs: Vec<BytesMut> = (0..16)
+                .map(|_| BytesMut::with_capacity(core::mem::size_of::<UdsEvent>() + 64))
+                .collect();
+
+            while running.load(Ordering::Relaxed) {
+                let mut guard = match async_fd.readable_mut().await {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                let buf = guard.get_inner_mut();
+                match buf.read_events(&mut out_bufs) {
+                    Ok(events) => {
+                        for i in 0..events.read {
+                            let data = &out_bufs[i];
+                            if data.len() >= core::mem::size_of::<UdsEvent>() {
+                                let event = unsafe { *(data.as_ptr() as *const UdsEvent) };
+                                if tx.send(event).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("error reading perf events on CPU {}: {e}", cpu_id);
+                    }
+                }
+                guard.clear_ready();
+            }
+        });
     }
+    drop(tx);
 
     // Handle Ctrl+C
-    let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -97,35 +133,28 @@ async fn run_async(args: TopArgs) -> anyhow::Result<()> {
     });
 
     let mut stats: HashMap<u32, ProcessStats> = HashMap::new();
-    let mut tick = interval(Duration::from_secs(args.interval));
-    let mut out_bufs: Vec<BytesMut> = (0..16)
-        .map(|_| BytesMut::with_capacity(core::mem::size_of::<UdsEvent>() + 64))
-        .collect();
+    let display_interval = Duration::from_secs(args.interval);
 
     eprintln!("Monitoring UDS traffic... Press Ctrl+C to stop.\n");
 
-    while running.load(Ordering::Relaxed) {
+    let mut last_display = tokio::time::Instant::now();
+
+    loop {
         tokio::select! {
-            _ = tick.tick() => {
-                print_top(&stats, &args);
-            }
-            _ = async {
-                for async_fd in &mut async_fds {
-                    if let Ok(mut guard) = async_fd.readable_mut().await {
-                        let buf = guard.get_inner_mut();
-                        if let Ok(events) = buf.read_events(&mut out_bufs) {
-                            for i in 0..events.read {
-                                let data = &out_bufs[i];
-                                if data.len() >= core::mem::size_of::<UdsEvent>() {
-                                    let event = unsafe { &*(data.as_ptr() as *const UdsEvent) };
-                                    update_stats(&mut stats, event);
-                                }
-                            }
-                        }
-                        guard.clear_ready();
-                    }
+            event = rx.recv() => {
+                match event {
+                    Some(ev) => update_stats(&mut stats, &ev),
+                    None => break,
                 }
-            } => {}
+            }
+            _ = tokio::time::sleep_until(last_display + display_interval) => {
+                print_top(&stats, &args);
+                last_display = tokio::time::Instant::now();
+            }
+        }
+
+        if !running.load(Ordering::Relaxed) {
+            break;
         }
     }
 
